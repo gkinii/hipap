@@ -1,0 +1,20 @@
+[submodule "SocialVAE"]
+    path = sota_traj_pred/SocialVAE
+    url  = https://github.com/xupei0610/SocialVAE
+
+[submodule "Human-Path-Prediction"]
+    path = sota_traj_pred/Human-Path-Prediction
+    url  = https://github.com/HarshayuGirase/Human-Path-Prediction
+
+[submodule "Human-Trajectory-Prediction-via-Neural-Social-Physics"]
+    path = sota_traj_pred/Human-Trajectory-Prediction-via-Neural-Social-Physics
+    url  = https://github.com/realcrane/Human-Trajectory-Prediction-via-Neural-Social-Physics
+
+[submodule "sophie"]
+    path = sota_traj_pred/sophie
+    url  =  https://github.com/coolsunxu/sophie
+
+[submodule "trajnetplusplusbaselines"]
+    path = sota_traj_pred/trajnetplusplusbaselines
+    url  = https://github.com/vita-epfl/trajnetplusplusbaselines
+
