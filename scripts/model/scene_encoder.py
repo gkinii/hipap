@@ -248,13 +248,11 @@ class SequenceFilterLayer(nn.Module):
         
         self.conv_norm = nn.LayerNorm(self.output_size)
         
-        # --- FIXED BLOCK START ---
         # Shortcut connection: needs projection if stride > 1 OR if channel counts mismatch
         if stride > 1 or hidden_size != self.output_size:
             self.shortcut = nn.Conv1d(hidden_size, self.output_size, kernel_size=1, stride=stride)
         else:
             self.shortcut = nn.Identity()
-        # --- FIXED BLOCK END ---
         
         # Feedforward block
         self.ff_layer1 = nn.Linear(self.output_size, self.output_size // 2)
@@ -267,7 +265,6 @@ class SequenceFilterLayer(nn.Module):
         else:
             self.max_pool = nn.Identity()
             
-    # forward method remains the same ...
     def forward(self, input):
         if input.dim() == 4:
             b, a, t, h = input.shape
@@ -286,7 +283,7 @@ class SequenceFilterLayer(nn.Module):
         conv_out = conv_out.transpose(1, 2)
         identity = identity.transpose(1, 2)
         
-        # Now shapes will match: (B, T, 256) + (B, T, 256)
+        # (B, T, 256) + (B, T, 256)
         x = self.conv_norm(conv_out + identity)
         
         # Feedforward block
