@@ -17,20 +17,24 @@ def spawn_goals(
     n, grid, pads,
     x_bounds, y_bounds,
     *, rng=None,
-    max_attempts=1000,
-    loosen_factor=1.5
+    max_attempts=10000,
+    loosen_factor=1.5,
+    min_distance=None  # Minimum distance between goals
 ):
     if n <= 0:
         return []
     if rng is None:
         rng = np.random.default_rng()
-
+    
+    # Set default minimum distance based on grid resolution if not specified
+    if min_distance is None:
+        min_distance = grid.resolution * 5  # Adjust multiplier as needed
+    
     # free-cell scan
     i_min = max(0, int((x_bounds[0] - grid.x_min) / grid.resolution))
     i_max = min(grid.cols, int(math.ceil((x_bounds[1] - grid.x_min) / grid.resolution)))
     j_min = max(0, int((y_bounds[0] - grid.y_min) / grid.resolution))
     j_max = min(grid.rows, int(math.ceil((y_bounds[1] - grid.y_min) / grid.resolution)))
-
     free = 0
     for i in range(i_min, i_max):
         for j in range(j_min, j_max):
@@ -38,40 +42,60 @@ def spawn_goals(
                 free += 1
     if free == 0:
         raise NoFreeCellsError(f"No free cells in region x={x_bounds}, y={y_bounds}")
-
+    
     goals = []
     attempts = 0
     attempts_since_loosen = 0
     total_cap = max_attempts * 10
     cur_xb, cur_yb = x_bounds, y_bounds
-
+    cur_min_dist = min_distance
+    
     while len(goals) < n:
         if attempts_since_loosen >= max_attempts:
-            # expand bounds
-            cx = (cur_xb[0] + cur_xb[1]) / 2
-            cy = (cur_yb[0] + cur_yb[1]) / 2
-            half_w = (cur_xb[1] - cur_xb[0]) * loosen_factor / 2
-            half_h = (cur_yb[1] - cur_yb[0]) * loosen_factor / 2
-            cur_xb = (cx - half_w, cx + half_w)
-            cur_yb = (cy - half_h, cy + half_h)
-            print(f"Loosening bounds to x={cur_xb}, y={cur_yb}")
-            attempts_since_loosen = 0
-
+            # First try reducing minimum distance constraint
+            if cur_min_dist > grid.resolution * 1.5:
+                cur_min_dist *= 0.75
+                print(f"Reducing minimum distance to {cur_min_dist:.3f}")
+                attempts_since_loosen = 0
+            else:
+                # Then expand bounds
+                cx = (cur_xb[0] + cur_xb[1]) / 2
+                cy = (cur_yb[0] + cur_yb[1]) / 2
+                half_w = (cur_xb[1] - cur_xb[0]) * loosen_factor / 2
+                half_h = (cur_yb[1] - cur_yb[0]) * loosen_factor / 2
+                cur_xb = (cx - half_w, cx + half_w)
+                cur_yb = (cy - half_h, cy + half_h)
+                print(f"Loosening bounds to x={cur_xb}, y={cur_yb}")
+                attempts_since_loosen = 0
+        
         gx = rng.uniform(*cur_xb)
         gy = rng.uniform(*cur_yb)
         idx = grid.to_idx((gx, gy))
+        
         if grid.in_bounds(idx) and grid.passable(idx, pads):
-            goals.append((gx, gy))
-            attempts_since_loosen = 0
+            # Check minimum distance constraint from existing goals
+            too_close = False
+            for ex_gx, ex_gy in goals:
+                dist_sq = (gx - ex_gx)**2 + (gy - ex_gy)**2
+                if dist_sq < cur_min_dist**2:
+                    too_close = True
+                    break
+            
+            if not too_close:
+                goals.append((gx, gy))
+                attempts_since_loosen = 0
+            else:
+                attempts_since_loosen += 1
         else:
             attempts_since_loosen += 1
-
+        
         attempts += 1
         if attempts > total_cap:
             raise RuntimeError(
                 f"Unable to place {n} goals after {attempts} attempts "
                 f"(initial x={x_bounds}, y={y_bounds})."
             )
+    
     return goals
 
 
@@ -264,78 +288,66 @@ def create_padded(
     color,
     edgecolor,
     *,
-    pad=0.15,
+    pad=0.2,
     rounding=0.15,
     zorder=1,
     rotation_deg=0,
     jitter_x=(0, 0),
     jitter_y=(0, 0),
-    draw=True
+    draw=True,
+    shape='rectangle'  # NEW: 'rectangle' or 'circle'
 ):
     """
-    Draw OR just compute a padded rectangle with optional jitter and rotation.
-
+    Draw OR just compute a padded shape (rectangle or circle) with optional jitter and rotation.
+    
+    For circles:
+    - 'width' is used as the diameter
+    - 'height' is ignored
+    - 'rotation_deg' is ignored (circles are rotationally symmetric)
+    
     Returns both 'collision_data' (with padding) and
     'original_collision_data' (without padding).
     """
-
     # 1) jitter
     x0 = position[0] + random.uniform(*jitter_x)
     y0 = position[1] + random.uniform(*jitter_y)
+    
+    if shape == 'circle':
+        return _create_padded_circle(
+            ax, x0, y0, width, color, edgecolor,
+            pad, zorder, draw
+        )
+    else:  # rectangle
+        return _create_padded_rectangle(
+            ax, x0, y0, width, height, color, edgecolor,
+            pad, rounding, zorder, rotation_deg, draw
+        )
 
-    # center of the ORIGINAL rect
-    cx, cy = x0 + width/2, y0 + height/2
 
+def _create_padded_circle(ax, x0, y0, diameter, color, edgecolor, pad, zorder, draw):
+    """Helper function to create a circular padded object"""
+    radius = diameter / 2
+    cx, cy = x0 + radius, y0 + radius
+    
     # --- compute original (no-pad) collision data ---
-    orig_corners = [
-        (x0,          y0),
-        (x0 + width,  y0),
-        (x0 + width,  y0 + height),
-        (x0,          y0 + height)
-    ]
-    if rotation_deg != 0:
-        ang = math.radians(rotation_deg)
-        cos_a, sin_a = math.cos(ang), math.sin(ang)
-        def rot(pt):
-            x, y = pt
-            xr = (x - cx) * cos_a - (y - cy) * sin_a + cx
-            yr = (x - cx) * sin_a + (y - cy) * cos_a + cy
-            return (xr, yr)
-        orig_corners = [rot(pt) for pt in orig_corners]
-
     original_collision_data = {
-        'type': 'rectangle',
-        'corners': orig_corners,
+        'type': 'circle',
+        'center': (cx, cy),
+        'radius': radius,
         'original_center': (cx, cy),
-        'width': width,
-        'height': height,
         'cumulative_translation': (0, 0),
-        'cumulative_rotation': rotation_deg
     }
-
+    
     # --- compute padded collision data ---
-    pad_w, pad_h = width + 2*pad, height + 2*pad
-    pad_x, pad_y = cx - pad_w/2, cy - pad_h/2
-
-    pad_corners = [
-        (pad_x,             pad_y),
-        (pad_x + pad_w,     pad_y),
-        (pad_x + pad_w,     pad_y + pad_h),
-        (pad_x,             pad_y + pad_h)
-    ]
-    if rotation_deg != 0:
-        pad_corners = [rot(pt) for pt in pad_corners]
-
+    padded_radius = radius + pad
     collision_data = {
-        'type': 'rectangle',
-        'corners': pad_corners,
+        'type': 'circle',
+        'center': (cx, cy),
+        'radius': padded_radius,
         'original_center': (cx, cy),
-        'width': pad_w,
-        'height': pad_h,
         'cumulative_translation': (0, 0),
-        'cumulative_rotation': rotation_deg
     }
-
+    
     # If not drawing, just return both data dicts
     if ax is None or not draw:
         return {
@@ -346,32 +358,138 @@ def create_padded(
             "original_collision_data": original_collision_data,
             "collision_data": collision_data
         }
+    
+    # --- drawing branch ---
+    # Main circle
+    patch = patches.Circle((cx, cy), radius,
+                          linewidth=1,
+                          edgecolor=edgecolor,
+                          facecolor=color,
+                          alpha=0.8,
+                          zorder=zorder)
+    ax.add_patch(patch)
+    
+    # Padding circle (invisible, for visualization if needed)
+    pad_circle = patches.Circle((cx, cy), padded_radius,
+                               linewidth=0,
+                               facecolor="none",
+                               zorder=zorder - 0.1)
+    
+    # Outline circle (visible boundary)
+    outline = patches.Circle((cx, cy), padded_radius,
+                            linewidth=1,
+                            edgecolor='black',
+                            facecolor='none',
+                            zorder=zorder - 0.1)
+    ax.add_patch(outline)
+    
+    return {
+        "patch": patch,
+        "pad": pad_circle,
+        "outline": outline,
+        "center": (cx, cy),
+        "original_collision_data": original_collision_data,
+        "collision_data": collision_data
+    }
 
+
+def _create_padded_rectangle(ax, x0, y0, width, height, color, edgecolor,
+                             pad, rounding, zorder, rotation_deg, draw):
+    """Helper function to create a rectangular padded object (original logic)"""
+    # center of the ORIGINAL rect
+    cx, cy = x0 + width/2, y0 + height/2
+    
+    # --- compute original (no-pad) collision data ---
+    orig_corners = [
+        (x0, y0),
+        (x0 + width, y0),
+        (x0 + width, y0 + height),
+        (x0, y0 + height)
+    ]
+    
+    if rotation_deg != 0:
+        ang = math.radians(rotation_deg)
+        cos_a, sin_a = math.cos(ang), math.sin(ang)
+        
+        def rot(pt):
+            x, y = pt
+            xr = (x - cx) * cos_a - (y - cy) * sin_a + cx
+            yr = (x - cx) * sin_a + (y - cy) * cos_a + cy
+            return (xr, yr)
+        
+        orig_corners = [rot(pt) for pt in orig_corners]
+    
+    original_collision_data = {
+        'type': 'rectangle',
+        'corners': orig_corners,
+        'original_center': (cx, cy),
+        'width': width,
+        'height': height,
+        'cumulative_translation': (0, 0),
+        'cumulative_rotation': rotation_deg
+    }
+    
+    # --- compute padded collision data ---
+    pad_w, pad_h = width + 2*pad, height + 2*pad
+    pad_x, pad_y = cx - pad_w/2, cy - pad_h/2
+    pad_corners = [
+        (pad_x, pad_y),
+        (pad_x + pad_w, pad_y),
+        (pad_x + pad_w, pad_y + pad_h),
+        (pad_x, pad_y + pad_h)
+    ]
+    
+    if rotation_deg != 0:
+        pad_corners = [rot(pt) for pt in pad_corners]
+    
+    collision_data = {
+        'type': 'rectangle',
+        'corners': pad_corners,
+        'original_center': (cx, cy),
+        'width': pad_w,
+        'height': pad_h,
+        'cumulative_translation': (0, 0),
+        'cumulative_rotation': rotation_deg
+    }
+    
+    # If not drawing, just return both data dicts
+    if ax is None or not draw:
+        return {
+            "patch": None,
+            "pad": None,
+            "outline": None,
+            "center": (cx, cy),
+            "original_collision_data": original_collision_data,
+            "collision_data": collision_data
+        }
+    
     # --- drawing branch ---
     patch = patches.Rectangle((x0, y0), width, height,
-                              linewidth=1,
-                              edgecolor=edgecolor,
-                              facecolor=color,
-                              alpha=0.8,
-                              zorder=zorder)
+                             linewidth=1,
+                             edgecolor=edgecolor,
+                             facecolor=color,
+                             alpha=0.8,
+                             zorder=zorder)
+    
     transform = mtrans.Affine2D().rotate_deg_around(cx, cy, rotation_deg) + ax.transData
     patch.set_transform(transform)
     ax.add_patch(patch)
-
+    
     pad_rect = patches.Rectangle((pad_x, pad_y), pad_w, pad_h,
-                                 linewidth=0,
-                                 facecolor="none",
-                                 transform=transform,
-                                 zorder=zorder - 0.1)
+                                linewidth=0,
+                                facecolor="none",
+                                transform=transform,
+                                zorder=zorder - 0.1)
+    
     outline = patches.FancyBboxPatch((pad_x, pad_y), pad_w, pad_h,
-                                     boxstyle=f"round,pad=0.,rounding_size={rounding}",
-                                     linewidth=1,
-                                     edgecolor='black',
-                                     facecolor='none',
-                                     transform=transform,
-                                     zorder=zorder - 0.1)
+                                    boxstyle=f"round,pad=0.,rounding_size={rounding}",
+                                    linewidth=1,
+                                    edgecolor='black',
+                                    facecolor='none',
+                                    transform=transform,
+                                    zorder=zorder - 0.1)
     ax.add_patch(outline)
-
+    
     return {
         "patch": patch,
         "pad": pad_rect,
@@ -380,6 +498,196 @@ def create_padded(
         "original_collision_data": original_collision_data,
         "collision_data": collision_data
     }
+
+
+def build_random_environment(ax, x_min, x_max, y_min, y_max, num_obstacles=5,
+                            obstacle_config=None, draw=True):
+    """
+    Build completely random environment with obstacles at random positions.
+    
+    Parameters:
+    - ax: Matplotlib axes for drawing
+    - x_min, x_max, y_min, y_max: Workspace bounds
+    - num_obstacles: Total number of obstacles (used if obstacle_config is None)
+    - obstacle_config: Optional dict specifying obstacle groups with different sizes
+                      Example: {
+                          'regular': {'count': 14, 'size_range': (1.0, 3.0), 'shape': 'rectangle'},
+                          'small': {'count': 6, 'size_range': (0.3, 0.8), 'pad': 0.1, 'shape': 'rectangle'},
+                          'circular': {'count': 10, 'size_range': (0.5, 1.5), 'pad': 0.15, 'shape': 'circle'}
+                      }
+                      The 'pad' key is optional and specifies collision padding
+                      The 'shape' key is optional (default: 'rectangle') and can be 'rectangle' or 'circle'
+    - draw: Whether to draw the obstacles
+    
+    Returns:
+    - pads: List of padded collision data
+    - centers: Tuple of (agv_center, mobile_center)
+    - objects_no_pad: List of original collision data without padding
+    """
+    pads = []
+    objects_no_pad = []
+    
+    def cp(ax, *args, **kwargs):
+        return create_padded(ax, *args, draw=draw, **kwargs)
+    
+    # Smaller workspace margins to allow objects near edges
+    margin = 0.
+    work_x_min, work_x_max = x_min + margin, x_max - margin
+    work_y_min, work_y_max = y_min + margin, y_max - margin
+    
+    # Color configurations for visual variety
+    color_configs = [
+        {"color": "lightgrey", "edge": "black"},
+        {"color": "wheat", "edge": "brown"},
+        {"color": "lightblue", "edge": "blue"},
+        {"color": "lightgreen", "edge": "green"},
+        {"color": "lightcoral", "edge": "red"},
+        {"color": "lightyellow", "edge": "orange"},
+        {"color": "lavender", "edge": "purple"},
+        {"color": "peachpuff", "edge": "darkorange"},
+    ]
+    
+    # Track placed object centers for better distribution
+    placed_centers = []
+    min_spacing = 1.5  # Minimum distance between object centers
+    
+    # Helper function to place a single obstacle
+    def place_obstacle(size_min, size_max, pad_value=None, shape='rectangle', attempts=50):
+        """Try to place an obstacle within the size range with specified padding and shape"""
+        for attempt in range(attempts):
+            # Random position
+            center_x = random.uniform(work_x_min, work_x_max)
+            center_y = random.uniform(work_y_min, work_y_max)
+            
+            # Check spacing from existing objects
+            too_close = False
+            for prev_x, prev_y in placed_centers:
+                dist = np.sqrt((center_x - prev_x)**2 + (center_y - prev_y)**2)
+                if dist < min_spacing:
+                    too_close = True
+                    break
+            
+            if not too_close or attempt == attempts - 1:
+                # Accept this position
+                colors = random.choice(color_configs)
+                
+                if shape == 'circle':
+                    # For circles, use size as diameter
+                    diameter = random.uniform(size_min, size_max)
+                    
+                    # Create circular obstacle
+                    if pad_value is not None:
+                        obstacle = create_padded(ax, (center_x, center_y), diameter, 0,
+                                               color=colors["color"], edgecolor=colors["edge"],
+                                               jitter_x=(0, 0), jitter_y=(0, 0),
+                                               pad=pad_value, draw=draw, shape='circle')
+                    else:
+                        obstacle = cp(ax, (center_x, center_y), diameter, 0,
+                                    color=colors["color"], edgecolor=colors["edge"],
+                                    jitter_x=(0, 0), jitter_y=(0, 0), shape='circle')
+                else:
+                    # Rectangle
+                    width = random.uniform(size_min, size_max)
+                    height = random.uniform(size_min, size_max)
+                    rotation = random.uniform(-45, 45)
+                    
+                    # Create rectangular obstacle
+                    if pad_value is not None:
+                        obstacle = create_padded(ax, (center_x, center_y), width, height,
+                                               color=colors["color"], edgecolor=colors["edge"],
+                                               jitter_x=(0, 0), jitter_y=(0, 0),
+                                               rotation_deg=rotation, pad=pad_value, draw=draw,
+                                               shape='rectangle')
+                    else:
+                        obstacle = cp(ax, (center_x, center_y), width, height,
+                                    color=colors["color"], edgecolor=colors["edge"],
+                                    jitter_x=(0, 0), jitter_y=(0, 0), 
+                                    rotation_deg=rotation, shape='rectangle')
+                
+                pads.append(obstacle["collision_data"])
+                objects_no_pad.append(obstacle["original_collision_data"])
+                placed_centers.append((center_x, center_y))
+                return True
+        
+        return False
+    
+    # Place obstacles based on configuration
+    if obstacle_config is not None:
+        # Use mixed obstacle sizes and shapes
+        for group_name, group_params in obstacle_config.items():
+            count = group_params['count']
+            size_range = group_params['size_range']
+            pad_value = group_params.get('pad', None)  # Optional pad parameter
+            shape = group_params.get('shape', 'rectangle')  # Optional shape parameter
+            
+            for i in range(count):
+                placed = place_obstacle(size_range[0], size_range[1], 
+                                      pad_value=pad_value, shape=shape)
+                if not placed:
+                    print(f"  Warning: Could not place {group_name} obstacle {i+1}/{count}")
+    else:
+        # Backward compatibility: use default size ranges
+        default_size_min = 1.0
+        default_size_max = 3.5
+        for i in range(num_obstacles):
+            placed = place_obstacle(default_size_min, default_size_max, shape='rectangle')
+            if not placed:
+                print(f"  Warning: Could not place obstacle {i+1}/{num_obstacles}")
+    
+    # AGV and Mobile robot placement (kept as rectangles)
+    AGV_WIDTH = 0.8
+    AGV_HEIGHT = 0.6
+    MOBILE_WIDTH = 0.6
+    MOBILE_HEIGHT = 0.4
+    
+    # Random AGV position
+    for attempt in range(50):
+        agv_x = random.uniform(work_x_min, work_x_max)
+        agv_y = random.uniform(work_y_min, work_y_max)
+        
+        too_close = False
+        for prev_x, prev_y in placed_centers:
+            dist = np.sqrt((agv_x - prev_x)**2 + (agv_y - prev_y)**2)
+            if dist < min_spacing:
+                too_close = True
+                break
+        
+        if not too_close or attempt == 49:
+            break
+    
+    agv = cp(ax, (agv_x, agv_y), AGV_WIDTH, AGV_HEIGHT,
+            color="lightcoral", edgecolor="red",
+            jitter_x=(0, 0), jitter_y=(0, 0),
+            rotation_deg=random.uniform(-30, 30), shape='rectangle')
+    pads.append(agv["collision_data"])
+    objects_no_pad.append(agv["original_collision_data"])
+    placed_centers.append((agv_x, agv_y))
+    
+    # Random Mobile position
+    for attempt in range(50):
+        mobile_x = random.uniform(work_x_min, work_x_max)
+        mobile_y = random.uniform(work_y_min, work_y_max)
+        
+        too_close = False
+        for prev_x, prev_y in placed_centers:
+            dist = np.sqrt((mobile_x - prev_x)**2 + (mobile_y - prev_y)**2)
+            if dist < min_spacing:
+                too_close = True
+                break
+        
+        if not too_close or attempt == 49:
+            break
+    
+    mobile = cp(ax, (mobile_x, mobile_y), MOBILE_WIDTH, MOBILE_HEIGHT,
+               color="plum", edgecolor="purple",
+               jitter_x=(0, 0), jitter_y=(0, 0),
+               rotation_deg=random.uniform(-30, 30), shape='rectangle')
+    pads.append(mobile["collision_data"])
+    objects_no_pad.append(mobile["original_collision_data"])
+    
+    centers = (agv["center"], mobile["center"])
+    
+    return pads, centers, objects_no_pad
 
 
 def get_bounds(center=None, width=None, height=None, margin=0.3, 
@@ -429,3 +737,15 @@ def get_bounds(center=None, width=None, height=None, margin=0.3,
         y_bounds = (obj_y - radius, obj_y + radius)
     
     return {"x_bounds": x_bounds, "y_bounds": y_bounds}
+
+
+def partition_goals(entries, n_parts):
+    partitions = [[] for _ in range(n_parts)]
+    for entry in entries:
+        n = entry["n_goals"]
+        slice_size = int(round(n * (1 / n_parts)))
+        p = [slice_size for _ in range(n_parts - 1)]
+        p.append(n - sum(p))
+        for i in range(n_parts):
+            partitions[i].append((entry["goal"], p[i]))
+    return partitions

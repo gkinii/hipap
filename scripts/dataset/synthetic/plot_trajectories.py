@@ -5,7 +5,7 @@ import random
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from scripts.dataset.functions import (
+from scripts.dataset.synthetic.utils import (
     Grid,
     spawn_goals,
     theta_star,
@@ -113,16 +113,7 @@ def build_environment(ax, agv_key, mobile_key, draw=True):
     return pads, centers, objects_no_pad
 
 
-def partition_goals(entries, n_parts):
-    partitions = [[] for _ in range(n_parts)]
-    for entry in entries:
-        n = entry["n_goals"]
-        slice_size = int(round(n * (1 / n_parts)))
-        p = [slice_size for _ in range(n_parts - 1)]
-        p.append(n - sum(p))
-        for i in range(n_parts):
-            partitions[i].append((entry["goal"], p[i]))
-    return partitions
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # PATH GENERATION + CSV LOGGING

@@ -241,5 +241,11 @@ workspace_demo2D.py
 HumanTrajectoryPredictionDataset/
 *.mp4
 *.png
+*.pgm
+*.csv
+*.jpg
+*.jpeg
+*.gif
+*.yaml
 trajectory_plots/
 humanpose3d/

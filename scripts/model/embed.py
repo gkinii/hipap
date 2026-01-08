@@ -40,7 +40,7 @@ class SinusoidalEmbeddingLayer(nn.Module):
             torch.sin(input_tensor * self.inv_freqs),
             torch.cos(input_tensor * self.inv_freqs)
         ], dim=-1)
-        
+
         return embedded
 
 class AgentTemporalEncoder(nn.Module):
@@ -54,7 +54,8 @@ class AgentTemporalEncoder(nn.Module):
     self.key = key
 
     self.embedding_layer = SinusoidalEmbeddingLayer(
-        max_freq=params.num_steps,
+        min_freq=0.5,
+        max_freq=2*params.seq_len,
         hidden_size=params.sin_embedding_size)
 
     self.mlp = nn.Linear(
@@ -65,14 +66,18 @@ class AgentTemporalEncoder(nn.Module):
 
   def _get_temporal_embedding(self, input_batch):
     
-    b, a, t, _ = input_batch[self.key].shape
+    if self.key is not None:
+        b, a, t, _ = input_batch[self.key].shape
+    
+    else:
+        b, a, t, _ = input_batch.shape
 
     t = torch.arange(0, t, dtype=torch.float32, device=input_batch[self.key].device)
     t = t[None, None, :]  # Add batch and agent dimensions
     t = t.repeat(b, a, 1)  # Expand to [b, num_agents, num_steps]
     # print(t.unsqueeze(-1).shape)
 
-    return self.embedding_layer(t.unsqueeze(-1)) #[b, num_agents, num_steps, 1, feature_embedding_size]
+    return self.embedding_layer(t) #[b, num_agents, num_steps, feature_embedding_size]
     
   def forward(self, input_batch):
         
@@ -110,7 +115,55 @@ class Agent2DOrientationEncoder(nn.Module):
         return self.mlp(orientation_embedding), mask
 
 class AgentPositionEncoder(nn.Module):
-    """Encodes agents spatial positions."""
+    """Encodes agents spatial positions with optional masking."""
+    def __init__(self, 
+                 key,  
+                 params,
+                 output_size):
+        super().__init__()
+        self.key = key
+        self.mask_key = f'{key}/mask'  # e.g., 'human_pos/mask'
+        self.coord_scale = params.grid_coord_scale
+        
+        self.sin_emb_layer = SinusoidalEmbeddingLayer(
+            min_freq=0.1,
+            max_freq=2*params.grid_coord_scale,
+            hidden_size=params.sin_embedding_size)
+        
+        self.mask_emb_layer = nn.Linear(
+            in_features=1,
+            out_features=output_size,
+            bias=True)
+        
+        self.ff_layer2 = nn.Linear(
+            in_features=params.sin_embedding_size,
+            out_features=output_size,
+            bias=True)
+
+        self.lnorm = nn.LayerNorm(output_size)
+    
+    def forward(self, input_batch):
+        # Get positions
+        positions = input_batch[self.key]  # [b, a, t, 2]
+        # Encode positions with sinusoidal embeddings
+        pos_emb = self.sin_emb_layer(positions)  # [b, a, t, 2, h1]
+        pos_emb = self.ff_layer2(pos_emb)  # [b, a, t, 2, h]
+        
+        if self.mask_key in input_batch:
+            mask = input_batch[self.mask_key] # [b, a, t, 1]
+
+            pos_emb = pos_emb * mask.unsqueeze(-2)
+
+            combined = pos_emb
+            # combined = self.lnorm(combined)
+
+        else:
+            combined = pos_emb
+
+        return combined
+    
+class StationPositionEncoder(nn.Module):
+    """Encodes station spatial positions."""
 
     def __init__(self, 
                  key,  
@@ -118,56 +171,57 @@ class AgentPositionEncoder(nn.Module):
                  output_size):
         super().__init__()
         self.key = key
-
+        self.coord_scale = params.grid_coord_scale
         self.sin_emb_layer = SinusoidalEmbeddingLayer(
-            hidden_size= params.sin_embedding_size)
+            min_freq=0.1,
+            max_freq=2*params.grid_coord_scale,
+            hidden_size=params.sin_embedding_size)
         
-        self.mask_emb_layer=nn.Linear(in_features=1,
-                            out_features=output_size,
-                            bias=True)
+        self.mask_emb_layer = nn.Linear(
+            in_features=1,
+            out_features=output_size,
+            bias=True)
 
         self.ff_layer1 = nn.Linear(
-            in_features= 2,
+            in_features=2,
             out_features=output_size,
             bias=True
         )
 
         self.ff_layer2 = nn.Linear(
-            in_features= params.sin_embedding_size,
+            in_features=params.sin_embedding_size,
             out_features=output_size,
             bias=True
         )
 
-        self.dropout=nn.Dropout(params.drop_prob)
-        self.lnorm=nn.LayerNorm(output_size)
+        self.lnorm = nn.LayerNorm(output_size)
 
     def forward(self, input_batch):
+        # input_batch[self.key] shape: [b, s, t, 2]
+        pos_input = input_batch[self.key]
+        b, s, t, _ = pos_input.shape
         
-        pos_emb = self.sin_emb_layer(input_batch[self.key])
+        # Apply sinusoidal embedding
+        pos_emb = self.sin_emb_layer(pos_input)  # [b, s, t, 2, sin_emb_size]
         
-        # input_batch=input_batch[self.key].unsqueeze(-2)
-        # pos_emb=self.ff_layer1(input_batch)
-
-        # mask_emb=self.mask_emb_layer(input_batch[f"{self.key}/mask"]).unsqueeze(-2)
-
-
-        # pos_emb=pos_emb+mask_emb
-        # pos_emb=F.relu(pos_emb)
-        # pos_emb=self.lnorm(pos_emb)
-        # pos_emb=F.relu(pos_emb)
-        pos_emb = self.ff_layer2(pos_emb)
-        # pos_emb=pos_emb.mean(dim=-2).unsqueeze(-2)
-        # pos_emb=self.dropout(pos_emb)
-
+        # Apply ff_layer2
+        pos_emb = self.ff_layer2(pos_emb)  # [b, s, t, 2, h]
+        
+        # Reshape to [b, 1, t, 2*s, h]
+        # We need to interleave the s and 2 dimensions
+        pos_emb = pos_emb.permute(0, 2, 1, 3, 4)  # [b, t, s, 2, h]
+        pos_emb = pos_emb.reshape(b, t, 2*s, -1)  # [b, t, 2*s, h]
+        pos_emb = pos_emb.unsqueeze(1)  # [b, 1, t, 2*s, h]
+        
         return pos_emb
-    
+
 class AgentScalarEncoder(nn.Module):
     """Encodes a agent's scalar."""
     
-    def __init__(self, key, output_shape):
+    def __init__(self, key, params, output_shape):
         super().__init__()
         self.key = key
-        
+        self.scale=1.6
         # Input size depends on the scalar feature dimension
         self.mlp = nn.Linear(
             in_features=1,  # assuming scalar input
@@ -176,21 +230,20 @@ class AgentScalarEncoder(nn.Module):
         )
     
     def forward(self, input_batch):
-        not_is_hidden = torch.logical_not(input_batch['is_hidden'])
-        mask = torch.logical_and(input_batch[f'has_data/{self.key}'], not_is_hidden)
         
-        mlp_output = self.mlp(input_batch[self.key])
+        velocity=input_batch[self.key]/self.scale
+        mlp_output = self.mlp(velocity.unsqueeze(-1))
         mlp_output = mlp_output.unsqueeze(-2)  
         
-        return mlp_output, mask
+        return mlp_output
 
 class AgentOneHotEncoder(nn.Module):
     
-    def __init__(self, key, output_shape, params):
+    def __init__(self, key, params, output_shape):
         super().__init__()
         self.key = key
         self.depth = params.depth
-        
+        self.seq_len=params.seq_len
         self.mlp = nn.Linear(
             in_features=self.depth,
             out_features=output_shape,
@@ -209,7 +262,9 @@ class AgentOneHotEncoder(nn.Module):
         
         mlp_output = self.mlp(stage_one_hot)
 
+        mlp_output = mlp_output.repeat(1,1,self.seq_len,1)
         mlp_output = mlp_output.unsqueeze(-2) 
+        
         return mlp_output
 
 class AgentKeypointsEncoder(nn.Module):
@@ -264,7 +319,7 @@ class AgentKeypointsEncoder(nn.Module):
         attn_out=attn_out.reshape(b,a,t,k*f)
         
         kpt_emb=self.ff_layer2(attn_out)
-        kpt_emb=F.relu(kpt_emb)
+        kpt_emb=F.gelu(kpt_emb)
         kpt_emb=self.ff_layer3(kpt_emb)
         kpt_emb=self.dropout(kpt_emb)
         # kpt_emb=self.ff_ln(kpt_emb+attn_out)

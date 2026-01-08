@@ -1,56 +1,50 @@
 import numpy as np
 from shapely.geometry import Polygon, Point
-
-def generate_occupancy_grid(grid, objects_no_pad, grid_id, grid_size=256, resolution=0.05, wall_thickness=2, x_min=-5.3, x_max=5.4, y_min=-6.3, y_max=6.3):
+import random
+from scipy import ndimage
+import os
+def generate_occupancy_grid(grid, objects_no_pad, grid_id, grid_size=256, resolution=0.05,
+                            wall_thickness=2, x_min=-5.3, x_max=5.4, y_min=-6.3, y_max=6.3,
+                            map_origin_x=-6.4, map_origin_y=-6.4, output_dir='256'):
     """
-    Generate occupancy grid as a 256x256 PGM file with proper workspace mapping.
+    Generate occupancy grid as a PGM file with proper workspace mapping.
     
     Parameters:
-    - grid: Grid object with environment bounds and resolution
-    - objects_no_pad: List of objects without padding
-    - grid_id: Identifier for the grid file
-    - grid_size: Target size of the square grid (default 256x256)
-    - resolution: Meters per pixel (default 0.05)
-    - wall_thickness: Thickness of workspace walls in pixels (default 2)
-    
-    Returns:
-    - grid_id: The grid identifier used
+    - map_origin_x, map_origin_y: Origin values to write to YAML file
     """
-    # Workspace bounds (from your specification)
   
-    
-    # Calculate actual workspace dimensions
-    workspace_width = x_max - x_min   # 10.6 meters
-    workspace_height = y_max - y_min   # 12.5 meters
-    
+    # Calculate workspace dimensions
+    workspace_width = x_max - x_min
+    workspace_height = y_max - y_min
+
     # Calculate workspace size in pixels based on resolution
-    workspace_width_pixels = int(workspace_width / resolution)   # 10.6 / 0.05 = 212 pixels
-    workspace_height_pixels = int(workspace_height / resolution)  # 12.5 / 0.05 = 250 pixels
-    
+    workspace_width_pixels = int(workspace_width / resolution)
+    workspace_height_pixels = int(workspace_height / resolution)
+
     # Verify calculations
     print(f"Workspace dimensions: {workspace_width:.2f}m x {workspace_height:.2f}m")
     print(f"Workspace in pixels: {workspace_width_pixels} x {workspace_height_pixels}")
-    
-    # Calculate padding needed to reach 256x256
-    padding_x_total = grid_size - workspace_width_pixels  # 256 - 212 = 44
-    padding_y_total = grid_size - workspace_height_pixels  # 256 - 250 = 6
-    
+
+    # Calculate padding needed to reach target grid size
+    padding_x_total = grid_size - workspace_width_pixels
+    padding_y_total = grid_size - workspace_height_pixels
+
     # Distribute padding evenly (left/right for x, bottom/top for y)
-    padding_x_left = padding_x_total // 2    # 22
-    padding_x_right = padding_x_total - padding_x_left  # 22
-    padding_y_bottom = padding_y_total // 2  # 3
-    padding_y_top = padding_y_total - padding_y_bottom  # 3
-    
+    padding_x_left = padding_x_total // 2
+    padding_x_right = padding_x_total - padding_x_left
+    padding_y_bottom = padding_y_total // 2
+    padding_y_top = padding_y_total - padding_y_bottom
+
     print(f"Padding: x_left={padding_x_left}, x_right={padding_x_right}, "
           f"y_bottom={padding_y_bottom}, y_top={padding_y_top}")
-    
-    # Create the full 256x256 grid initialized with gray (unknown/unexplored)
+
+    # Create the full grid initialized with gray (unknown/unexplored)
     # Use 128 for gray in 0-255 range
-    full_grid = np.full((grid_size, grid_size), 128, dtype=np.uint8)
-    
+    full_grid = np.full((grid_size, grid_size), 192, dtype=np.uint8)
+
     # Create workspace occupancy grid (initially all free = 255)
     workspace_grid = np.full((workspace_height_pixels, workspace_width_pixels), 255, dtype=np.uint8)
-    
+
     # Function to convert environment coords to workspace grid indices
     def env_to_workspace_grid(x, y):
         """Convert environment coordinates to workspace grid pixel indices."""
@@ -61,19 +55,19 @@ def generate_occupancy_grid(grid, objects_no_pad, grid_id, grid_size=256, resolu
         i = max(0, min(workspace_width_pixels - 1, i))
         j = max(0, min(workspace_height_pixels - 1, j))
         return i, j
-    
+
     # Add walls (black borders) around the workspace edges
-    # wall_thickness is now a parameter (default 2 pixels)
-    
     # Top and bottom walls (horizontal)
-    workspace_grid[0:wall_thickness, :] = 0  # Top wall (in image coords)
-    workspace_grid[-wall_thickness:, :] = 0  # Bottom wall (in image coords)
-    
+    workspace_grid[0:wall_thickness, :] = 0  # Top wall
+    workspace_grid[-wall_thickness:, :] = 0  # Bottom wall
     # Left and right walls (vertical)
     workspace_grid[:, 0:wall_thickness] = 0  # Left wall
     workspace_grid[:, -wall_thickness:] = 0  # Right wall
-    
+
     # Mark occupied cells for each object in the workspace grid
+    obstacle_outline_value = 0
+    outline_thickness = 2  # Thickness of outline in pixels
+
     for obj in objects_no_pad:
         poly = Polygon(obj['corners'])
         
@@ -85,8 +79,11 @@ def generate_occupancy_grid(grid, objects_no_pad, grid_id, grid_size=256, resolu
         i_max = min(workspace_width_pixels - 1, max(i for i, j in grid_coords))
         j_min = max(0, min(j for i, j in grid_coords))
         j_max = min(workspace_height_pixels - 1, max(j for i, j in grid_coords))
-        
-        # Check each cell in the bounding box
+
+        # Create a temporary mask for this obstacle
+        obstacle_mask = np.zeros((workspace_height_pixels, workspace_width_pixels), dtype=bool)
+
+        # Mark all cells inside the polygon
         for i in range(i_min, i_max + 1):
             for j in range(j_min, j_max + 1):
                 # Convert grid indices back to environment coordinates
@@ -95,61 +92,144 @@ def generate_occupancy_grid(grid, objects_no_pad, grid_id, grid_size=256, resolu
                 
                 # Check if this point is inside the polygon
                 if poly.contains(Point(x, y)):
-                    # Mark as occupied (0 = black)
-                    # Note: In image coordinates, row 0 is at top
-                    # We want y=0 at bottom, so we flip the j index
-                    workspace_grid[workspace_height_pixels - 1 - j, i] = 0
-    
-    # Place the workspace grid into the full 256x256 grid with padding
-    # Calculate where to place the workspace grid in the full grid
-    start_row = padding_y_bottom  # Start from bottom padding
+                    # Flip j index so y=0 is at bottom
+                    flipped_j = workspace_height_pixels - 1 - j
+                    obstacle_mask[flipped_j, i] = True
+
+        # --- MODIFICATION STARTS HERE ---
+        # Randomly choose between 192 (light gray) and 255 (white)
+        # random.choice selects one value from the list with equal probability
+        current_interior_value = random.choice([192, 255, 128, 216])
+        
+        # Apply color to the mask
+        workspace_grid[obstacle_mask] = current_interior_value
+        # --- MODIFICATION ENDS HERE ---
+
+        # Then mark the outline as black
+        # Create erosion structure based on desired thickness
+        structure_size = 2 * outline_thickness + 1
+        erode_structure = np.ones((structure_size, structure_size))
+        
+        # Erode the mask to get interior only
+        eroded = ndimage.binary_erosion(obstacle_mask, structure=erode_structure)
+        
+        # Outline is where original mask is True but eroded is False
+        outline_mask = obstacle_mask & ~eroded
+        workspace_grid[outline_mask] = obstacle_outline_value
+
+    # Place the workspace grid into the full grid with padding
+    start_row = padding_y_bottom
     end_row = start_row + workspace_height_pixels
-    start_col = padding_x_left  # Start from left padding
+    start_col = padding_x_left
     end_col = start_col + workspace_width_pixels
-    
+
     # Copy workspace grid into the padded full grid
     full_grid[start_row:end_row, start_col:end_col] = workspace_grid
-    
+
     # Write PGM file
-    write_pgm(full_grid, f"grid_{grid_id}.pgm")
-    
-    # Also save metadata for reference
-    save_grid_metadata(grid_id, x_min, x_max, y_min, y_max, resolution, 
-                      padding_x_left, padding_x_right, padding_y_bottom, padding_y_top,
-                      wall_thickness)
-    
+    write_pgm(full_grid, f"grid_{grid_id}.pgm", grid_size, output_dir=output_dir)
+
+    # Save map YAML for ROS/navigation
+    save_map_yaml(grid_id, resolution, map_origin_x, map_origin_y, output_dir=output_dir, grid_dir=output_dir)
+
     return grid_id
 
+   
+METADATA_OUTPUT_DIR = "grid_metadata" 
 
-def write_pgm(occupancy_grid, filename):
+def ensure_directory_exists(directory):
+    """Create directory if it doesn't exist."""
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory)
+        print(f"Created directory: {directory}")
+
+def write_pgm(occupancy_grid, filename, grid_size, output_dir='256'):
     """
-    Write occupancy grid as a PGM file.
+    Write occupancy grid as PGM file.
     
     Parameters:
-    - occupancy_grid: 2D numpy array (0=occupied, 128=unknown/padding, 255=free)
-    - filename: Output PGM filename
+    - occupancy_grid: The grid data to save
+    - filename: Name of the file (without path)
+    - grid_size: Size of the grid
+    - output_dir: Directory to save the file (default: GRID_OUTPUT_DIR)
     """
-    height, width = occupancy_grid.shape
+    ensure_directory_exists(output_dir)
+    filepath = os.path.join(output_dir, filename) if output_dir else filename
     
-    # Write PGM file (P5 = binary format)
-    with open(filename, 'wb') as f:
-        # Header
+    height, width = occupancy_grid.shape
+    with open(filepath, 'wb') as f:
         header = f"P5\n{width} {height}\n255\n"
         f.write(header.encode('ascii'))
-        # Binary data
         f.write(occupancy_grid.tobytes())
-    
-    print(f"Saved occupancy grid to {filename} (256x256 PGM)")
+    print(f"Saved occupancy grid to {filepath} ({grid_size}x{grid_size} PGM)")
 
+def save_map_yaml(grid_id, resolution, origin_x, origin_y, 
+                  output_dir='256', grid_dir='256'):
+    """
+    Save map YAML file compatible with ROS navigation stack.
+    
+    Parameters:
+    - grid_id: Identifier for the map
+    - resolution: Meters per pixel
+    - origin_x, origin_y: Origin coordinates for the map
+    - output_dir: Directory to save YAML file (default: YAML_OUTPUT_DIR)
+    - grid_dir: Directory where PGM files are stored (for relative path in YAML)
+    """
+    ensure_directory_exists(output_dir)
+    
+    # Determine the relative path to the PGM file
+    if grid_dir and output_dir:
+        # Calculate relative path from YAML dir to grid dir
+        grid_path = os.path.relpath(
+            os.path.join(grid_dir, f"grid_{grid_id}.pgm"),
+            output_dir
+        )
+    elif grid_dir:
+        grid_path = os.path.join(grid_dir, f"grid_{grid_id}.pgm")
+    else:
+        grid_path = f"grid_{grid_id}.pgm"
+    
+    origin_z = 0.0
+    yaml_content = f"""image: {grid_path}
+mode: trinary
+resolution: {resolution:.3f}
+origin: [{origin_x:.3f}, {origin_y:.3f}, {origin_z:.3f}]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+"""
+    
+    filename = f"map_{grid_id}.yaml"
+    filepath = os.path.join(output_dir, filename) if output_dir else filename
+    
+    with open(filepath, 'w') as f:
+        f.write(yaml_content)
+    print(f"Saved map YAML to {filepath}")
+    print(f"  Origin: [{origin_x:.3f}, {origin_y:.3f}, {origin_z:.3f}]")
+    print(f"  Image path: {grid_path}")
 
 def save_grid_metadata(grid_id, x_min, x_max, y_min, y_max, resolution,
-                       pad_left, pad_right, pad_bottom, pad_top, wall_thickness):
+                       pad_left, pad_right, pad_bottom, pad_top, 
+                       wall_thickness, grid_size, output_dir=METADATA_OUTPUT_DIR):
     """
-    Save metadata about the grid for later reference.
+    Save metadata about the grid.
     
-    This helps with coordinate transformations when using the grid.
+    Parameters:
+    - grid_id: Identifier for the grid
+    - x_min, x_max, y_min, y_max: Workspace bounds
+    - resolution: Grid resolution in meters per pixel
+    - pad_left, pad_right, pad_bottom, pad_top: Padding in pixels
+    - wall_thickness: Thickness of walls
+    - grid_size: Total grid size
+    - output_dir: Directory to save metadata (default: METADATA_OUTPUT_DIR)
     """
     import json
+    
+    ensure_directory_exists(output_dir)
+    
+    # Calculate the origin of the full grid in environment coordinates
+    origin_x = x_min - pad_left * resolution
+    origin_y = y_min - pad_bottom * resolution
     
     metadata = {
         'grid_id': grid_id,
@@ -160,8 +240,13 @@ def save_grid_metadata(grid_id, x_min, x_max, y_min, y_max, resolution,
             'y_max': y_max
         },
         'resolution': resolution,
-        'grid_size': 256,
+        'grid_size': grid_size,
         'wall_thickness': wall_thickness,
+        'origin': {
+            'x': origin_x,
+            'y': origin_y,
+            'description': 'Position of full grid bottom-left corner (0,0) in environment coordinates'
+        },
         'workspace_pixels': {
             'width': int((x_max - x_min) / resolution),
             'height': int((y_max - y_min) / resolution)
@@ -174,13 +259,15 @@ def save_grid_metadata(grid_id, x_min, x_max, y_min, y_max, resolution,
         }
     }
     
-    with open(f"grid_{grid_id}_metadata.json", 'w') as f:
-        json.dump(metadata, f, indent=2)
+    filename = f"grid_{grid_id}_metadata.json"
+    filepath = os.path.join(output_dir, filename) if output_dir else filename
     
-    print(f"Saved grid metadata to grid_{grid_id}_metadata.json")
+    with open(filepath, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved grid metadata to {filepath}")
+    print(f"Full grid origin in environment coords: ({origin_x:.3f}, {origin_y:.3f})")
 
-
-def coords_to_pixel(x, y, resolution=0.05):
+def coords_to_pixel(x, y, resolution=0.05, x_min=-5.3, x_max=5.4, y_min=-6.3, y_max=6.3, grid_size=256):
     """
     Convert world coordinates to pixel coordinates in the 256x256 grid.
     
@@ -192,16 +279,16 @@ def coords_to_pixel(x, y, resolution=0.05):
     - pixel_x, pixel_y: Pixel coordinates in the 256x256 grid
     """
     # Workspace bounds
-    x_min, x_max = -5.3, 5.4
-    y_min, y_max = -6.3, 6.3
+    x_min, x_max = x_min, x_max
+    y_min, y_max = y_min, y_max
     
     # Calculate workspace dimensions in pixels
-    workspace_width_pixels = int((x_max - x_min) / resolution)   # 212
-    workspace_height_pixels = int((y_max - y_min) / resolution)  # 250
-    
+    workspace_width_pixels = int((x_max - x_min) / resolution)   
+    workspace_height_pixels = int((y_max - y_min) / resolution)  
+
     # Calculate padding
-    padding_x_left = (256 - workspace_width_pixels) // 2  # 22
-    padding_y_bottom = (256 - workspace_height_pixels) // 2  # 3
+    padding_x_left = (grid_size - workspace_width_pixels) // 2  
+    padding_y_bottom = (grid_size - workspace_height_pixels) // 2  
     
     # Convert to workspace pixel coordinates
     workspace_pixel_x = (x - x_min) / resolution
@@ -209,7 +296,7 @@ def coords_to_pixel(x, y, resolution=0.05):
     
     # Add padding and flip y-axis (image coordinates have y=0 at top)
     pixel_x = workspace_pixel_x + padding_x_left
-    pixel_y = 256 - (workspace_pixel_y + padding_y_bottom)
+    pixel_y = grid_size - (workspace_pixel_y + padding_y_bottom)
     
     # Clamp to grid bounds
     pixel_x = max(0, min(255, int(pixel_x)))
@@ -218,7 +305,7 @@ def coords_to_pixel(x, y, resolution=0.05):
     return pixel_x, pixel_y
 
 
-def pixel_to_coords(pixel_x, pixel_y, resolution=0.05):
+def pixel_to_coords(pixel_x, pixel_y, resolution=0.05, x_min=-5.3, x_max=5.4, y_min=-6.3, y_max=6.3, grid_size=256):
     """
     Convert pixel coordinates in the 256x256 grid to world coordinates.
     
@@ -230,20 +317,20 @@ def pixel_to_coords(pixel_x, pixel_y, resolution=0.05):
     - x, y: World coordinates
     """
     # Workspace bounds
-    x_min, x_max = -5.25, 5.35
-    y_min, y_max = -3.5, 9.0
+    x_min, x_max = x_min, x_max
+    y_min, y_max = y_min, y_max
     
     # Calculate workspace dimensions in pixels
     workspace_width_pixels = int((x_max - x_min) / resolution)   # 212
     workspace_height_pixels = int((y_max - y_min) / resolution)  # 250
     
     # Calculate padding
-    padding_x_left = (256 - workspace_width_pixels) // 2  # 22
-    padding_y_bottom = (256 - workspace_height_pixels) // 2  # 3
+    padding_x_left = (grid_size - workspace_width_pixels) // 2  # 22
+    padding_y_bottom = (grid_size - workspace_height_pixels) // 2  # 3
     
     # Remove padding and unflip y-axis
     workspace_pixel_x = pixel_x - padding_x_left
-    workspace_pixel_y = (256 - pixel_y) - padding_y_bottom
+    workspace_pixel_y = (grid_size - pixel_y) - padding_y_bottom
     
     # Convert to world coordinates
     x = x_min + workspace_pixel_x * resolution

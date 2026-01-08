@@ -11,10 +11,11 @@ from PIL import Image
 import torchvision.transforms as transforms
 import yaml
 
-FEATURE_COLS=['x', 'y', 'z', 'agent_type', 'frame_id','agent_id']
+
+FEATURE_COLS=['x', 'y', 'z', 'agent_type', 'frame_id','agent_id', 'bottle_x', 'bottle_y', 'plant_x', 'plant_y', 'table_x', 'table_y', 'food_x', 'food_y', 'entrance_x', 'entrance_y', 'exit_x', 'exit_y']
 DESIRED_KPTS = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,91,112]
 
-class TrajectoryPredictionDataset(Dataset):
+class StationTrajectoryPredictionDataset(Dataset):
     def __init__(self, data_path: str, seq_len: int, pred_len: int, stride: int):
         self.all_files: list[str]=glob.glob(os.path.join(data_path, "*.csv"))
         self.json_files: list[str]=glob.glob(os.path.join(data_path, "*.json"))
@@ -23,6 +24,7 @@ class TrajectoryPredictionDataset(Dataset):
         self.data_path = data_path
         self.max_human_agents: int=1
         self.max_robot_agents: int=2
+        self.max_stations: int=6  # bottle, plant, table, food, entrance, exit
         self.stride: int=stride
         self.desired_kpts: list[int]=DESIRED_KPTS
         self.input_windows: list[dict]=[]
@@ -123,8 +125,8 @@ class TrajectoryPredictionDataset(Dataset):
                 except Exception as e:
                     print(f"Error loading JSON {jsonfile}: {e}")
                     json_data = None
-            else:
-                print(f"No JSON found for map{map_id}_run{run_id} - loading without keypoints")
+            # else:
+            #     print(f"No JSON found for map{map_id}_run{run_id} - loading without keypoints")
             
             # Load CSV data
             sensor_df=pd.read_csv(file)[FEATURE_COLS]
@@ -149,6 +151,7 @@ class TrajectoryPredictionDataset(Dataset):
                 human_kpts_window = np.full((self.max_human_agents, self.seq_len, len(self.desired_kpts), 4), np.nan, dtype=np.float32)
                 prediction_window = np.full((self.max_human_agents, self.pred_len, 3), np.nan, dtype=np.float32)
                 robot_window = np.full((self.max_robot_agents, self.seq_len, 4), np.nan, dtype=np.float32)
+                stations_window = np.full((self.max_stations, self.seq_len, 2), np.nan, dtype=np.float32)
                 
                 # Collect all agents in window and create ID mapping
                 human_ids = set()
@@ -174,7 +177,7 @@ class TrajectoryPredictionDataset(Dataset):
                                 slot = human_id_to_slot[int(row[5])]
                                 prediction_window[slot, j, :] = row[0:3]
                 
-                if np.isnan(prediction_window).all():
+                if np.isnan(prediction_window).any():
                     continue
                 
                 # Fill input window
@@ -190,6 +193,15 @@ class TrajectoryPredictionDataset(Dataset):
                             elif row[3] == 0 and agent_id in robot_id_to_slot:
                                 slot = robot_id_to_slot[agent_id]
                                 robot_window[slot, i, 0:3] = row[0:3]
+                            
+                            # Extract station positions from the row (indices 6-17)
+                            # bottle_x, bottle_y, plant_x, plant_y, table_x, table_y, food_x, food_y, entrance_x, entrance_y, exit_x, exit_y
+                            stations_window[0, i, :] = row[6:8]   # bottle
+                            stations_window[1, i, :] = row[8:10]  # plant
+                            stations_window[2, i, :] = row[10:12] # table
+                            stations_window[3, i, :] = row[12:14] # food
+                            stations_window[4, i, :] = row[14:16] # entrance
+                            stations_window[5, i, :] = row[16:18] # exit
                     
                     # Check missing data
                     human_missing = np.isnan(human_window[:self.max_human_agents, i, 0:3]).all(axis=1)
@@ -221,7 +233,7 @@ class TrajectoryPredictionDataset(Dataset):
                                 human_window[first_slot, i, 4:] = kpts_with_mask.reshape(-1)
                 
                 # Skip window only if all human positions are NaN (no data at all)
-                if np.isnan(human_window[:, :, 0:3]).all():
+                if np.isnan(human_window[:, :, 0:3]).any():
                     continue
                 
                 # Create masks
@@ -234,11 +246,20 @@ class TrajectoryPredictionDataset(Dataset):
                 
                 prediction_window_mask = np.where(np.isnan(prediction_window), 0.0, 1.0).astype(np.float32)
                 
+                # Create stations mask: shape [6, seq_len, 1]
+                # Mask is 1 only if BOTH x and y are valid, 0 if either is NaN
+                stations_window_mask = np.zeros((self.max_stations, self.seq_len, 1), dtype=np.float32)
+                for station_idx in range(self.max_stations):
+                    for t in range(self.seq_len):
+                        if not np.isnan(stations_window[station_idx, t, 0]) and not np.isnan(stations_window[station_idx, t, 1]):
+                            stations_window_mask[station_idx, t, 0] = 1.0
+                
                 # Replace NaN with 0
                 human_window = np.nan_to_num(human_window, 0.0).astype(np.float32)
                 human_kpts_window = np.nan_to_num(human_kpts_window, 0.0).astype(np.float32)
                 robot_window = np.nan_to_num(robot_window, 0.0).astype(np.float32)
                 prediction_window = np.nan_to_num(prediction_window, 0.0).astype(np.float32)
+                stations_window = np.nan_to_num(stations_window, 0.0).astype(np.float32)
                 
                 # Store windows
                 self.input_windows.append({
@@ -250,6 +271,8 @@ class TrajectoryPredictionDataset(Dataset):
                     'robot_pos': robot_window[:,:,0:2],
                     'robot_pos_mask': robot_window_mask,
                     'robot_pos/mask': robot_window_mask[:,:, 3:4],
+                    'stations_pos': stations_window,
+                    'stations_pos_mask': stations_window_mask,
                 })
                 
                 self.prediction_windows.append({
